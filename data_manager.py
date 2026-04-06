@@ -50,13 +50,21 @@ def _save_csv(df, path):
 
 def _sb_load(table: str, columns: list) -> pd.DataFrame:
     """Load all rows from a Supabase table into a DataFrame."""
-    sb = _get_sb()
-    resp = sb.table(table).select("*").execute()
-    if resp.data:
-        df = pd.DataFrame(resp.data)
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
-        return df
+    try:
+        sb = _get_sb()
+        resp = sb.table(table).select("*").execute()
+        if resp.data:
+            df = pd.DataFrame(resp.data)
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+            return df
+    except Exception as e:
+        import streamlit as st
+        st.warning(f"⚠️ Supabase read error ({table}): {e}. Using local CSV fallback.")
+        return _load_csv(
+            {"transactions": TRANSACTIONS_FILE, "investments": INVESTMENTS_FILE, "savings": SAVINGS_FILE}.get(table, TRANSACTIONS_FILE),
+            columns,
+        )
     return pd.DataFrame(columns=columns)
 
 
@@ -70,24 +78,36 @@ def _sb_upsert(table: str, records: list[dict]):
 
 def _sb_insert(table: str, records: list[dict]):
     """Insert new rows."""
-    sb = _get_sb()
     if not records:
         return
-    sb.table(table).insert(records).execute()
+    try:
+        sb = _get_sb()
+        # Insert in batches of 500 to avoid payload limits
+        batch_size = 500
+        for i in range(0, len(records), batch_size):
+            sb.table(table).insert(records[i:i+batch_size]).execute()
+    except Exception as e:
+        import streamlit as st
+        st.error(f"⚠️ Supabase insert error ({table}): {e}")
 
 
 def _sb_update_rows(table: str, df: pd.DataFrame):
     """Update existing rows by id."""
-    sb = _get_sb()
-    for _, row in df.iterrows():
-        if "id" in row and pd.notna(row["id"]):
-            data = row.to_dict()
-            row_id = data.pop("id")
-            # Convert date to string for JSON
-            for k, v in data.items():
-                if isinstance(v, pd.Timestamp):
-                    data[k] = v.strftime("%Y-%m-%d")
-            sb.table(table).update(data).eq("id", int(row_id)).execute()
+    try:
+        sb = _get_sb()
+        for _, row in df.iterrows():
+            if "id" in row and pd.notna(row["id"]):
+                data = row.to_dict()
+                row_id = data.pop("id")
+                for k, v in data.items():
+                    if isinstance(v, pd.Timestamp):
+                        data[k] = v.strftime("%Y-%m-%d")
+                    elif pd.isna(v):
+                        data[k] = None
+                sb.table(table).update(data).eq("id", int(row_id)).execute()
+    except Exception as e:
+        import streamlit as st
+        st.error(f"⚠️ Supabase update error ({table}): {e}")
 
 
 def _df_to_records(df: pd.DataFrame) -> list[dict]:

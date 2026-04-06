@@ -273,7 +273,7 @@ if page == "📊 Dashboard":
 elif page == "📄 Upload Statement":
     st.title("📄 Upload Card / Bank Statement (PDF)")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         currency = st.selectbox("Statement Currency", CURRENCIES, index=0)
     with col2:
@@ -281,6 +281,13 @@ elif page == "📄 Upload Statement":
             "Statement Year", min_value=2020, max_value=2030,
             value=datetime.now().year, step=1
         )
+    with col3:
+        month_names = [
+            "All (auto-detect)", "January", "February", "March", "April",
+            "May", "June", "July", "August", "September", "October",
+            "November", "December",
+        ]
+        stmt_month = st.selectbox("Statement Month", month_names, index=0)
 
     uploaded_files = st.file_uploader(
         "Upload one or more PDF statements",
@@ -307,6 +314,14 @@ elif page == "📄 Upload Statement":
                     st.warning(f"⚠️ Could not extract transactions from {uploaded_file.name}. "
                                "The PDF format may not be supported. Try a different statement format.")
                     continue
+
+                # Filter by selected month if specified
+                if stmt_month != "All (auto-detect)":
+                    month_num = month_names.index(stmt_month)  # 1-12
+                    df = df[df["date"].dt.month == month_num]
+                    if df.empty:
+                        st.warning(f"⚠️ No transactions found for {stmt_month} in {uploaded_file.name}.")
+                        continue
 
                 # Auto-categorize
                 df = categorize_dataframe(df)

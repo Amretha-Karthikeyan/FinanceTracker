@@ -131,18 +131,26 @@ def extract_statement_period(pdf_path: str) -> Optional[str]:
 
 def _parse_date_str(text: str, fallback_year: int = None) -> Optional[datetime]:
     text = text.strip()
-    fmts = [
-        "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y",
-        "%Y-%m-%d", "%d/%m/%y", "%d/%m", "%d %b", "%d%b",
+    year = fallback_year or datetime.now().year
+    # For formats without a year, inject the fallback year before parsing
+    # to avoid Python 3.15+ deprecation warnings
+    fmts_with_year = [
+        ("%d/%m/%Y", False), ("%d-%m-%Y", False), ("%d %b %Y", False),
+        ("%d %B %Y", False), ("%Y-%m-%d", False), ("%d/%m/%y", False),
     ]
-    for fmt in fmts:
+    fmts_no_year = [
+        ("%d/%m", "%d/%m/%Y"), ("%d %b", "%d %b %Y"), ("%d%b", "%d%b%Y"),
+    ]
+    for fmt, _ in fmts_with_year:
         try:
-            dt = datetime.strptime(text, fmt)
-            if fmt in ("%d %b", "%d%b", "%d/%m") and fallback_year:
-                dt = dt.replace(year=fallback_year)
-            elif fmt in ("%d %b", "%d%b", "%d/%m"):
-                dt = dt.replace(year=datetime.now().year)
-            return dt
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    # For formats without year, append year to string and format
+    for short_fmt, full_fmt in fmts_no_year:
+        try:
+            datetime.strptime(text, short_fmt)  # validate pattern
+            return datetime.strptime(f"{text}{year}", f"{short_fmt}%Y")
         except ValueError:
             continue
     return None

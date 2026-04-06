@@ -1,5 +1,12 @@
+-- ============================================================
 -- Run this in Supabase SQL Editor to create the tables
 -- Go to: Supabase Dashboard → SQL Editor → New Query
+-- ============================================================
+
+-- Drop existing tables if re-running
+DROP TABLE IF EXISTS transactions CASCADE;
+DROP TABLE IF EXISTS investments CASCADE;
+DROP TABLE IF EXISTS savings CASCADE;
 
 -- Transactions table
 CREATE TABLE transactions (
@@ -37,12 +44,14 @@ CREATE TABLE savings (
     month_year TEXT
 );
 
--- Enable Row Level Security (optional but recommended)
-ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE investments ENABLE ROW LEVEL SECURITY;
-ALTER TABLE savings ENABLE ROW LEVEL SECURITY;
+-- DISABLE Row Level Security (single-user app, anon key access)
+-- This is the simplest setup — no RLS policies needed.
+ALTER TABLE transactions DISABLE ROW LEVEL SECURITY;
+ALTER TABLE investments DISABLE ROW LEVEL SECURITY;
+ALTER TABLE savings DISABLE ROW LEVEL SECURITY;
 
--- Allow full access via the anon key (single-user app)
-CREATE POLICY "Allow all on transactions" ON transactions FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all on investments" ON investments FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all on savings" ON savings FOR ALL USING (true) WITH CHECK (true);
+-- Grant full access to anon and authenticated roles
+GRANT ALL ON transactions TO anon, authenticated;
+GRANT ALL ON investments TO anon, authenticated;
+GRANT ALL ON savings TO anon, authenticated;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;
