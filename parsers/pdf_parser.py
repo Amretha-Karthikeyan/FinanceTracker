@@ -1,6 +1,6 @@
 """
 PDF Statement Parser
-Supports common bank / credit-card statement layouts.
+Supports Citibank SG and OCBC SG credit-card statement layouts.
 Uses pdfplumber for text extraction and regex-based line parsing.
 """
 
@@ -8,45 +8,139 @@ import re
 import pdfplumber
 import pandas as pd
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 
-# ─── Common date patterns found in statements ────────────────
-DATE_PATTERNS = [
-    # DD/MM/YYYY, DD-MM-YYYY
-    r"\b(\d{2}[/-]\d{2}[/-]\d{4})\b",
-    # DD MMM YYYY  (e.g. 05 Jan 2026)
-    r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})\b",
-    # DD MMM  (e.g. 05 Jan — year inferred)
-    r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)\b",
-    # DDMMM  (e.g. 16FEB, 01MAR — no space, Citibank style)
-    r"(?:^|\s)(\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC))\b",
+# ─── Lines to skip (noise) ───────────────────────────────────
+SKIP_PATTERNS = [
+    r"BALANCE\s*PREVIOUS",
+    r"LAST\s*MONTH",
+    r"SUB-?\s*TOTAL",
+    r"GRAND\s*TOTAL",
+    r"TOTAL\s*AMOUNT",
+    r"^SUBTOTAL",
+    r"^TOTAL\b",
+    r"FOREIGN\s*CURRENCY",
+    r"PREVIOUS\s+PAYMENTS",
+    r"STATEMENT\s*DATE",
+    r"PAYMENT\s*DUE",
+    r"PAGE\s+\d+\s+OF",
+    r"CREDIT\s*LIMIT",
+    r"XXXX-XXXX",
+    r"MINIMUM\s*PAYMENT",
+    r"INTEREST\s*RATE",
+    r"TRANSACTION(S)?\s*FOR\b",
+    r"ALL\s*TRANSACTIONS?\s*BILLED",
+    r"KINDLY\s*ENSURE",
+    r"REWARD|REBATE|SMRT\$|CASHBACK\s+(carried|earned)",
+    r"^RetailInterestRate",
+    r"^CashInterestRate",
+    r"\bCREDIT\s*CARD\s*TYPE\b",
+    r"\bACCOUNT\s*NUMBER\b",
+    r"YOURCITIBANKCARDS",
+    r"PAYMENTSLIP",
+    r"CITISMRTPLATINUM\b",
+    r"CITICASHBACK\b.*CARD\b",
+]
+_SKIP_RE = re.compile("|".join(SKIP_PATTERNS), re.IGNORECASE)
+
+# ─── Date patterns (order matters — most specific first) ─────
+# Each entry: (compiled_regex, strptime_format, needs_year_fallback)
+_DATE_DEFS: List[Tuple[re.Pattern, str, bool]] = [
+    # DD/MM/YYYY or DD-MM-YYYY
+    (re.compile(r"\b(\d{2}[/-]\d{2}[/-]\d{4})\b"), None, False),
+    # DD MMM YYYY  (05 Jan 2026)
+    (re.compile(r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})\b", re.I), None, False),
     # YYYY-MM-DD
-    r"\b(\d{4}-\d{2}-\d{2})\b",
+    (re.compile(r"\b(\d{4}-\d{2}-\d{2})\b"), "%Y-%m-%d", False),
+    # DDMMM  (16FEB, 01MAR — Citibank, no space, no year)
+    (re.compile(r"(?:^|\s)(\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC))\b", re.I), "%d%b", True),
+    # DD MMM  (5 Jan — with space, no year)
+    (re.compile(r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)\b", re.I), "%d %b", True),
+    # DD/MM  (04/03 — OCBC, no year)
+    (re.compile(r"^(\d{2}/\d{2})\b"), "%d/%m", True),
     # DD/MM/YY
-    r"\b(\d{2}/\d{2}/\d{2})\b",
+    (re.compile(r"\b(\d{2}/\d{2}/\d{2})\b"), "%d/%m/%y", False),
 ]
 
-# Amount patterns — handles 1,234.56 or 1234.56 with optional CR/DR suffix
-AMOUNT_PATTERN = r"[\$S]*\s*([\d,]+\.\d{2})\s*(CR|DR|cr|dr)?"
-# Parenthesized amounts indicate credits, e.g. (1,847.30)
-CREDIT_AMOUNT_PATTERN = r"\(([\d,]+\.\d{2})\)"
+# Amount with optional CR/DR suffix
+_AMT_RE = re.compile(r"([\d,]+\.\d{2})\s*(CR|DR)?", re.I)
+# Parenthesized credit amount  e.g. (1,847.30)
+_CREDIT_AMT_RE = re.compile(r"\(([\d,]+\.\d{2})\)")
 
 
-def _parse_date(text: str, fallback_year: int = None) -> Optional[datetime]:
-    """Try multiple date formats and return a datetime or None."""
+# ═════════════════════════════════════════════════════════════
+# Public API
+# ═════════════════════════════════════════════════════════════
+
+def parse_pdf_statement(
+    pdf_path: str,
+    currency: str = "SGD",
+    statement_year: int = None,
+) -> pd.DataFrame:
+    if statement_year is None:
+        statement_year = datetime.now().year
+
+    all_txns: List[Dict] = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
+                continue
+            for line in text.split("\n"):
+                txn = _parse_line(line, currency, statement_year)
+                if txn:
+                    all_txns.append(txn)
+
+    if not all_txns:
+        all_txns = _parse_via_tables(pdf_path, currency, statement_year)
+
+    df = pd.DataFrame(all_txns)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+    return df
+
+
+def extract_statement_period(pdf_path: str) -> Optional[str]:
+    with pdfplumber.open(pdf_path) as pdf:
+        if pdf.pages:
+            text = pdf.pages[0].extract_text() or ""
+            m = re.search(
+                r"(?:statement\s+(?:period|date)|billing\s+period|period)"
+                r"[:\s]+(\d{1,2}\s+\w+\s+\d{4})\s*[-–to]+\s*(\d{1,2}\s+\w+\s+\d{4})",
+                text, re.I,
+            )
+            if m:
+                end_date = _parse_date_str(m.group(2))
+                if end_date:
+                    return end_date.strftime("%b %Y")
+            m2 = re.search(
+                r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})",
+                text, re.I,
+            )
+            if m2:
+                return m2.group(1)
+    return None
+
+
+# ═════════════════════════════════════════════════════════════
+# Internal helpers
+# ═════════════════════════════════════════════════════════════
+
+def _parse_date_str(text: str, fallback_year: int = None) -> Optional[datetime]:
     text = text.strip()
-    formats = [
+    fmts = [
         "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y",
-        "%Y-%m-%d", "%d/%m/%y", "%d %b", "%d%b",
+        "%Y-%m-%d", "%d/%m/%y", "%d/%m", "%d %b", "%d%b",
     ]
-    for fmt in formats:
+    for fmt in fmts:
         try:
             dt = datetime.strptime(text, fmt)
-            # If year was not in the pattern, set fallback
-            if fmt in ("%d %b", "%d%b") and fallback_year:
+            if fmt in ("%d %b", "%d%b", "%d/%m") and fallback_year:
                 dt = dt.replace(year=fallback_year)
-            elif fmt in ("%d %b", "%d%b"):
+            elif fmt in ("%d %b", "%d%b", "%d/%m"):
                 dt = dt.replace(year=datetime.now().year)
             return dt
         except ValueError:
@@ -54,131 +148,96 @@ def _parse_date(text: str, fallback_year: int = None) -> Optional[datetime]:
     return None
 
 
+def _find_date(line: str) -> Optional[Tuple[re.Match, str, bool]]:
+    """Return (match_obj, date_string, needs_year_fallback) or None."""
+    for regex, _, needs_year in _DATE_DEFS:
+        m = regex.search(line)
+        if m:
+            return m, m.group(1), needs_year
+    return None
+
+
 def _clean_amount(text: str) -> float:
-    """Convert '1,234.56' → 1234.56"""
     return float(text.replace(",", ""))
 
 
-def parse_pdf_statement(
-    pdf_path: str,
-    currency: str = "SGD",
-    statement_year: int = None,
-) -> pd.DataFrame:
-    """
-    Parse a bank / credit-card PDF statement and return a DataFrame of
-    transactions with columns: date, description, amount, type, currency.
-    
-    The parser uses a two-pass strategy:
-      1. Extract all text lines from each page.
-      2. For each line, look for a date + amount pattern to identify
-         transaction rows.  Everything between date and amount is the
-         description.
-    """
-    if statement_year is None:
-        statement_year = datetime.now().year
-
-    all_transactions: List[Dict] = []
-
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
-                continue
-
-            lines = text.split("\n")
-            for line in lines:
-                txn = _parse_transaction_line(line, currency, statement_year)
-                if txn:
-                    all_transactions.append(txn)
-
-    if not all_transactions:
-        # Fallback: try table extraction
-        all_transactions = _parse_via_tables(pdf_path, currency, statement_year)
-
-    df = pd.DataFrame(all_transactions)
-    if not df.empty:
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").reset_index(drop=True)
-    return df
+def _is_noise(line: str) -> bool:
+    return bool(_SKIP_RE.search(line))
 
 
-def _parse_transaction_line(
-    line: str, currency: str, year: int
-) -> Optional[Dict]:
-    """Attempt to parse a single text line into a transaction dict."""
-    # Try each date pattern
-    date_match = None
-    date_str = None
-    for pat in DATE_PATTERNS:
-        m = re.search(pat, line, re.IGNORECASE)
-        if m:
-            date_match = m
-            date_str = m.group(1)
-            break
-
-    if not date_match:
+def _parse_line(line: str, currency: str, year: int) -> Optional[Dict]:
+    """Parse a single text line into a transaction dict."""
+    line = line.strip()
+    if not line or _is_noise(line):
         return None
 
-    parsed_date = _parse_date(date_str, fallback_year=year)
+    found = _find_date(line)
+    if not found:
+        return None
+    date_match, date_str, needs_year = found
+    parsed_date = _parse_date_str(date_str, fallback_year=year if needs_year else None)
     if not parsed_date:
         return None
 
-    # Check for parenthesized (credit) amount first, e.g. (1,847.30)
-    credit_match = re.search(CREDIT_AMOUNT_PATTERN, line)
-    if credit_match:
-        amount = _clean_amount(credit_match.group(1))
-        desc_start = date_match.end()
-        desc_end = credit_match.start()
-        description = line[desc_start:desc_end].strip()
-        description = re.sub(r"\s+", " ", description)
-        if not description:
-            description = line[date_match.end():].strip()
-            description = re.sub(CREDIT_AMOUNT_PATTERN, "", description).strip()
-            description = re.sub(AMOUNT_PATTERN, "", description).strip()
-        if not description:
-            return None
-        return {
-            "date": parsed_date,
-            "description": description,
-            "amount": amount,
-            "type": "credit",
-            "currency": currency,
-        }
+    after_date = line[date_match.end():].strip()
 
-    # Find amount(s) in the line
-    amounts = list(re.finditer(AMOUNT_PATTERN, line))
+    # ── Check for parenthesized credit amount, e.g. (1,847.30) ──
+    credit_m = _CREDIT_AMT_RE.search(after_date)
+    if credit_m:
+        amount = _clean_amount(credit_m.group(1))
+        desc = after_date[:credit_m.start()].strip()
+        desc = _clean_desc(desc)
+        if not desc:
+            return None
+        return _txn(parsed_date, desc, amount, "credit", currency)
+
+    # ── Regular amount(s) ────────────────────────────────────
+    amounts = list(_AMT_RE.finditer(after_date))
     if not amounts:
         return None
 
-    # Use the LAST amount on the line (usually the transaction amount)
+    # Use the LAST amount on the line (transaction amount)
     amt_match = amounts[-1]
     amount = _clean_amount(amt_match.group(1))
     dr_cr = amt_match.group(2)
+    txn_type = "credit" if (dr_cr and dr_cr.upper() == "CR") else "debit"
 
-    # Determine debit vs credit
-    txn_type = "debit"
-    if dr_cr and dr_cr.upper() == "CR":
-        txn_type = "credit"
+    desc = after_date[:amt_match.start()].strip()
+    # Remove any intermediate amounts (balance columns etc.)
+    if len(amounts) > 1:
+        desc = after_date[:amounts[0].start()].strip()
+        # If first amount IS the transaction amount (only one meaningful),
+        # keep the wider description
+        if not desc:
+            desc = after_date[:amt_match.start()].strip()
 
-    # Description = text between date and amount
-    desc_start = date_match.end()
-    desc_end = amt_match.start()
-    description = line[desc_start:desc_end].strip()
-
-    # Clean up description
-    description = re.sub(r"\s+", " ", description)
-    # Remove stray amounts in middle (sometimes balance column)
-    # Keep only meaningful text
-    if len(description) < 2:
-        description = line[date_match.end():].strip()
-        description = re.sub(AMOUNT_PATTERN, "", description).strip()
-
-    if not description:
+    desc = _clean_desc(desc)
+    if not desc:
         return None
 
+    # Extra guard: skip if description looks like a summary/header line
+    if re.match(r"^\d[\d,]*\.\d{2}$", desc):
+        return None
+
+    return _txn(parsed_date, desc, amount, txn_type, currency)
+
+
+def _clean_desc(desc: str) -> str:
+    """Normalise whitespace, strip stray amounts and trailing country codes."""
+    desc = re.sub(r"\s+", " ", desc).strip()
+    # Remove stray embedded amounts like "SGD 66.31"
+    desc = re.sub(r"\b[A-Z]{3}\s+[\d,]+\.\d{2}\b", "", desc).strip()
+    # Remove trailing 2-letter country codes that pdfplumber sometimes leaves
+    desc = re.sub(r"\s+[A-Z]{2}$", "", desc).strip()
+    # Remove leading dash + 4-digit card suffix (OCBC style: -6061 ...)
+    desc = re.sub(r"^-\d{4}\s+", "", desc).strip()
+    return desc
+
+
+def _txn(dt, desc, amount, txn_type, currency):
     return {
-        "date": parsed_date,
-        "description": description,
+        "date": dt,
+        "description": desc,
         "amount": amount,
         "type": txn_type,
         "currency": currency,
@@ -199,18 +258,15 @@ def _parse_via_tables(
                 for row in table:
                     if not row or len(row) < 3:
                         continue
-                    # Try to find date in first columns
                     for i, cell in enumerate(row):
                         if cell is None:
                             continue
-                        parsed_date = None
-                        for pat in DATE_PATTERNS:
-                            m = re.search(pat, str(cell), re.IGNORECASE)
-                            if m:
-                                parsed_date = _parse_date(m.group(1), year)
-                                break
-                        if parsed_date:
-                            # Find amount in remaining columns
+                        found = _find_date(str(cell))
+                        if found:
+                            _, ds, ny = found
+                            parsed_date = _parse_date_str(ds, year if ny else None)
+                            if not parsed_date:
+                                continue
                             desc_parts = []
                             amount = None
                             txn_type = "debit"
@@ -218,50 +274,20 @@ def _parse_via_tables(
                                 if j == i or col is None:
                                     continue
                                 col_str = str(col).strip()
-                                am = re.search(AMOUNT_PATTERN, col_str)
-                                if am:
-                                    try:
-                                        amount = _clean_amount(am.group(1))
-                                        if am.group(2) and am.group(2).upper() == "CR":
-                                            txn_type = "credit"
-                                    except:
-                                        pass
-                                else:
-                                    if col_str and not re.match(r"^[\d,.\s]+$", col_str):
-                                        desc_parts.append(col_str)
-
+                                cm = _CREDIT_AMT_RE.search(col_str)
+                                am = _AMT_RE.search(col_str)
+                                if cm:
+                                    amount = _clean_amount(cm.group(1))
+                                    txn_type = "credit"
+                                elif am:
+                                    amount = _clean_amount(am.group(1))
+                                    if am.group(2) and am.group(2).upper() == "CR":
+                                        txn_type = "credit"
+                                elif col_str and not re.match(r"^[\d,.\s]+$", col_str):
+                                    desc_parts.append(col_str)
                             if amount and desc_parts:
-                                transactions.append({
-                                    "date": parsed_date,
-                                    "description": " ".join(desc_parts),
-                                    "amount": amount,
-                                    "type": txn_type,
-                                    "currency": currency,
-                                })
-                            break  # found date in this row, move on
+                                transactions.append(
+                                    _txn(parsed_date, " ".join(desc_parts), amount, txn_type, currency)
+                                )
+                            break
     return transactions
-
-
-def extract_statement_period(pdf_path: str) -> Optional[str]:
-    """Try to extract statement period (month/year) from the first page."""
-    with pdfplumber.open(pdf_path) as pdf:
-        if pdf.pages:
-            text = pdf.pages[0].extract_text() or ""
-            # Look for patterns like "Statement Period: 01 Jan 2026 - 31 Jan 2026"
-            m = re.search(
-                r"(?:statement\s+(?:period|date)|billing\s+period|period)"
-                r"[:\s]+(\d{1,2}\s+\w+\s+\d{4})\s*[-–to]+\s*(\d{1,2}\s+\w+\s+\d{4})",
-                text, re.IGNORECASE
-            )
-            if m:
-                end_date = _parse_date(m.group(2))
-                if end_date:
-                    return end_date.strftime("%b %Y")
-            # Look for month/year in header
-            m2 = re.search(
-                r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})",
-                text, re.IGNORECASE
-            )
-            if m2:
-                return m2.group(1)
-    return None
