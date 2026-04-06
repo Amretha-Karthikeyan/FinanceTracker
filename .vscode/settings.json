@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd c:\\\\Users\\\\natarani\\\\job-hunt-app; C:\\\\Users\\\\natarani\\\\AppData\\\\Local\\\\Python\\\\bin\\\\python\\.exe -c \"\nimport requests, json\nr = requests\\.get\\('https://jobs\\.workable\\.com/api/v1/jobs', params=\\{'query': 'Business Analyst', 'location': 'Singapore', 'limit': 3\\}, headers=\\{'User-Agent': 'Mozilla/5\\.0', 'Accept': 'application/json'\\}, timeout=15\\)\nprint\\(f'Status: \\{r\\.status_code\\}'\\)\ndata = r\\.json\\(\\)\nif isinstance\\(data, dict\\):\n    print\\(f'Keys: \\{list\\(data\\.keys\\(\\)\\)\\}'\\)\n    items = data\\.get\\('results', data\\.get\\('jobs', \\[\\]\\)\\)\nelse:\n    items = data\nfor item in \\(items or \\[\\]\\)\\[:2\\]:\n    print\\(json\\.dumps\\(item, indent=2, default=str\\)\\[:800\\]\\)\n    print\\('---'\\)\n\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
