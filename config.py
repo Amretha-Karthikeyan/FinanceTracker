@@ -108,6 +108,10 @@ TRANSACTIONS_FILE = os.path.join(DATA_DIR, "transactions.csv")
 INVESTMENTS_FILE = os.path.join(DATA_DIR, "investments.csv")
 SAVINGS_FILE = os.path.join(DATA_DIR, "savings.csv")
 
+# ─── Supabase ─────────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # anon/public key
+
 # CSV column definitions
 TRANSACTION_COLUMNS = [
     "date", "description", "amount", "currency", "category",
