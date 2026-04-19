@@ -2,6 +2,9 @@
 Data Manager — Supabase-backed storage for transactions,
 investments, and savings.  Falls back to local CSV if
 Supabase is not configured.
+
+All Supabase operations use the authenticated client so that
+Row Level Security (RLS) filters data per user automatically.
 """
 
 import os
@@ -12,16 +15,29 @@ from config import (
     SUPABASE_URL, SUPABASE_KEY,
 )
 
-# ─── Supabase client (lazy singleton) ────────────────────────
-_supabase = None
-
 
 def _get_sb():
-    global _supabase
-    if _supabase is None and SUPABASE_URL and SUPABASE_KEY:
+    """
+    Return an authenticated Supabase client (with user's JWT).
+    Falls back to anon client if auth module not available.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    try:
+        from auth import get_authenticated_client
+        return get_authenticated_client()
+    except ImportError:
         from supabase import create_client
-        _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return _supabase
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def _get_user_id() -> str | None:
+    """Get the current authenticated user's UUID."""
+    try:
+        from auth import get_user_id
+        return get_user_id()
+    except ImportError:
+        return None
 
 
 def _use_supabase() -> bool:
@@ -77,11 +93,16 @@ def _sb_upsert(table: str, records: list[dict]):
 
 
 def _sb_insert(table: str, records: list[dict]):
-    """Insert new rows."""
+    """Insert new rows with the current user's ID."""
     if not records:
         return
     try:
         sb = _get_sb()
+        user_id = _get_user_id()
+        # Attach user_id to every record
+        for rec in records:
+            if user_id:
+                rec["user_id"] = user_id
         # Insert in batches of 500 to avoid payload limits
         batch_size = 500
         for i in range(0, len(records), batch_size):
@@ -120,6 +141,7 @@ def _df_to_records(df: pd.DataFrame) -> list[dict]:
             elif pd.isna(v):
                 rec[k] = None
         rec.pop("id", None)  # Let Supabase auto-generate id
+        rec.pop("user_id", None)  # Will be set by _sb_insert
     return records
 
 

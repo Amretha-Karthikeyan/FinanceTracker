@@ -27,8 +27,15 @@ from data_manager import (
     monthly_spending_summary, monthly_investment_summary,
     monthly_savings_summary, grand_totals,
 )
+from auth import require_auth, sign_out, init_auth
 
-# ─── Page Config ──────────────────────────────────────────────
+# ─── Auth Gate — must sign in before anything else ────────────
+init_auth()
+user = require_auth()
+
+# ─── Page Config (set after auth since require_auth sets it for login page) ───
+# Note: set_page_config can only be called once. Since require_auth calls
+# st.stop() when not authenticated, this only runs for authenticated users.
 st.set_page_config(
     page_title="Household Finance Tracker",
     page_icon="💰",
@@ -58,6 +65,14 @@ st.markdown("""
 
 # ─── Sidebar ──────────────────────────────────────────────────
 st.sidebar.title("💰 Finance Tracker")
+
+# User info + logout
+st.sidebar.markdown(f"👤 **{user.get('email', 'User')}**")
+if st.sidebar.button("🚪 Sign Out", use_container_width=True):
+    sign_out()
+    st.rerun()
+st.sidebar.markdown("---")
+
 page = st.sidebar.radio(
     "Navigate",
     ["📊 Dashboard", "📄 Upload Statement", "💳 Transactions",
@@ -633,7 +648,7 @@ elif page == "⚙️ Manage Categories":
 # ─── Footer ──────────────────────────────────────────────────
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    "**Household Finance Tracker** v1.0\n\n"
+    "**Household Finance Tracker** v2.0\n\n"
     "Currencies: SGD 🇸🇬 & INR 🇮🇳\n\n"
     f"📅 {datetime.now().strftime('%b %Y')}"
 )
